@@ -192,21 +192,22 @@ AddEventHandler('atena:player:preSpawn', conduct)
 AddEventHandler('std-charselect:picked', function(src, pilaId)
     hideSelect(src)   -- the choice is made → drop the screen + its focus before we spawn the player in
     if not atenaUp() then return end
-    local custodiaId
+    local custodiaId, bound
     if custodiaUp() then
         pcall(function() custodiaId = exports['std-custodia']:custodiaForPila(pilaId) end)
     end
     if custodiaId then
-        pcall(function() exports['atena-bridge-custodia']:bindBody(src, custodiaId) end)
+        pcall(function() bound = exports['atena-bridge-custodia']:bindBody(src, custodiaId) end)
     end
-    -- Release the spawn GATED (delegated → only spawnPlayer enters the world): the new ped lands HIDDEN (black +
-    -- invisible) so the base-ped model swap and the wrong spawn point are never seen. bridge-custodia re-applies
-    -- the saved look on atena:player:spawned and signals applied → atena revealPlayer fades the finished body in.
-    -- The reveal handshake is now complete (custodia signals after paint), so the gate no longer risks a stuck
-    -- black screen — the 8s client backstop only fires if the apply itself fails. pcall: a transient must not
-    -- strand the held spawn.
-    logFlow('info', ('pick src %d -> gated spawn (custodia %s)'):format(src, tostring(custodiaId)))
-    pcall(function() exports.atena:spawnPlayer(src, Bridge.spawn, true) end)
+    -- Release the spawn. GATE ONLY WHEN A BODY IS BOUND: a gated spawn lands HIDDEN (black) and waits for the
+    -- bound body's paint → applied → revealPlayer. If nothing is bound (custodia down, no body resolved, or bind
+    -- failed) NOTHING would ever signal applied → the player would sit black until the 8s client backstop. So gate
+    -- only on a successful bind; otherwise spawn PLAIN (visible at once, default ped — better than a black wait).
+    -- A gated bind hides the base-ped model swap + the wrong spawn point until the saved look is on. pcall: a
+    -- transient must not strand the held spawn.
+    local gate = bound == true or nil
+    logFlow('info', ('pick src %d -> %s spawn (custodia %s)'):format(src, gate and 'gated' or 'plain', tostring(custodiaId)))
+    pcall(function() exports.atena:spawnPlayer(src, Bridge.spawn, gate) end)
 end)
 
 -- CREATE-NEW from the select screen (a free slot was chosen) → drop the screen, then the same create route
@@ -232,7 +233,9 @@ AddEventHandler('std-entry:resleeveComplete', function(src, _gender, blob)
     -- bounded wait for those deps (warm by now), then persist. Every failure path is logged with its reason.
     CreateThread(function()
         local deadline = GetGameTimer() + FORGE_TIMEOUT_MS
-        while (accountRefOf(src) == nil or not pilaBridgeUp() or not custodiaBridgeUp()) and GetGameTimer() < deadline do
+        while GetGameTimer() < deadline do
+            if sessionStage(src) == nil then return end   -- player left mid-wait → stop (no orphan write, no lingering 10s)
+            if accountRefOf(src) ~= nil and pilaBridgeUp() and custodiaBridgeUp() then break end
             Wait(250)
         end
         local id, reason = forgePair(src, accountRefOf(src))
