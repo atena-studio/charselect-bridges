@@ -18,6 +18,7 @@ shared_scripts {
 }
 
 server_scripts {
+    'server/cap.lua',           -- per-account slot-cap override (Bridge.capFor) + /pilecap admin command + schema
     'server/main.lua',          -- the conductor: owns preSpawn, routes create/select/pick, binds + spawns
 }
 

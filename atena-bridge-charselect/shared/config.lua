@@ -13,5 +13,6 @@ Bridge.spawn = { x = 215.0, y = -810.0, z = 30.7, heading = 145.0 }
 -- the free-slot count handed to the select screen (and whether "new character" is offered). Default 1 (the spec's
 -- v1 cap). MIRRORED here (not read from std-charselect): the cap is a DEPLOYMENT policy the conductor owns — the
 -- standalone only enforces the slotsFree count it is HANDED, it has no opinion on the cap itself. Raise to allow
--- multiple characters with zero code change. Kept as the single source the conductor reads (Config.maxPile or 1).
+-- multiple characters with zero code change. This is the GLOBAL default; an individual account can be given its
+-- own cap at runtime (server/cap.lua, /pilecap) — Bridge.capFor(src) returns that override or falls back here.
 Bridge.maxPile = 1

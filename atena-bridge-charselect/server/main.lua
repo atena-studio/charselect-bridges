@@ -113,6 +113,30 @@ local function forgePair(src, accountRef)
     return custodiaId, nil
 end
 
+-- Serialize forging per account AND enforce the pile cap, atomically (check-then-commit — atena-security §2).
+-- The roster read + the forge must not interleave with another forge for the SAME account: two sessions of one
+-- account (or a duplicate createNew intent) would otherwise both pass an under-cap check and forge a DUPLICATE
+-- character — a cap-1 account ending with 2 rows is data corruption. A per-account in-flight lock closes the
+-- yield window (forgePair yields on the pila/custodia DB writes); the cap re-check under the lock refuses an
+-- over-cap create. Returns (custodiaId, nil) only for a fresh, under-cap forge; (nil, reason) on refuse — a
+-- 'cap-reached:N/M' reason tells the caller to route to select, any other reason defers to forge-on-demand.
+local creating = {}   -- accountId → true while a forge for this account is in flight (the per-account lock)
+local function forgeGuarded(src, accountRef)
+    if accountRef == nil then return nil, 'no-account' end
+    if creating[accountRef] then return nil, 'create-in-flight' end   -- another forge for this account is mid-write
+    creating[accountRef] = true
+    local roster = {}
+    if pilaUp() then pcall(function() roster = exports['std-pila']:pilaListForAccount(accountRef) or {} end) end
+    local cap = Bridge.capFor(src)   -- per-account override (cap.lua) or the global Bridge.maxPile default
+    if #roster >= cap then
+        creating[accountRef] = nil
+        return nil, ('cap-reached:%d/%d'):format(#roster, cap)
+    end
+    local id, reason = forgePair(src, accountRef)
+    creating[accountRef] = nil   -- release: the pila row now exists (or the forge failed) → next read sees truth
+    return id, reason
+end
+
 -- Write the authored appearance onto the forged body and bind it to the session (so the spawn re-applies it
 -- from the body, and a relog re-reads it). The single durable-persist path, shared by the happy path and the
 -- forge-on-demand recovery below. custodiaSetAppearance lands in custodia_bodies via the DB persistence swap.
@@ -126,20 +150,36 @@ local function persistCreate(src, custodiaId, blob)
     logFlow('info', ('create persisted for src %d (custodia %s)'):format(src, tostring(custodiaId)))
 end
 
--- CREATE: a new character (no characters yet, or a free slot was chosen). Forge the pila+custodia pair, drop
--- into a private bucket, and run the entry cinematic. The appearance authored in entry is PERSISTED onto the
+-- CREATE: a new character (no characters yet, or a free slot was chosen). Forge the pila+custodia pair and
+-- run the entry cinematic IN THE LOBBY (the player is already there from conduct — entry's scene/preview peds
+-- are client-local, and other players are hidden locally, so no per-player bucket is needed; §7.1.2 invariant
+-- b "idem entry"). Phase 4 (the spawn at the create exit) is owned by THIS conductor — entry cedes. The
+-- appearance authored in entry is PERSISTED onto the
 -- body at resleeveComplete (below) and bound to the session, so it survives a relog/restart; entry itself also
 -- applies the look client-side (setModel + applySleeve) — complementary, that's the immediate paint, this is
 -- the durable write. entry's preSpawn auto-begin is suppressed when this conductor is up, so begin() is driven
 -- here. `skippable` is a forward hook (spec §3: 1st intro mandatory, later ones skippable); with maxPile=1 the
 -- create is always the 1st → never skippable yet. The real per-character skip is a future slice; default false.
+local startSelect   -- forward decl: an over-cap create routes here (startSelect is defined just below)
 local function startCreate(src, skippable)   -- luacheck: ignore skippable
     if not atenaUp() or not entryUp() then return end
     local accountRef = accountIdOf(src)
-    pendingCreate[src] = forgePair(src, accountRef)   -- remember the body to persist the look onto (nil if a dep is down)
+    local custodiaId, reason = forgeGuarded(src, accountRef)
+    -- AT CAP: this create is illegitimate (the account's slots are full — a stale/hostile createNew, or a second
+    -- session racing the first). Do NOT author a character that can't be saved: route to select so the player
+    -- picks an existing one (a cap-reached reason only comes back once a sibling forge has committed, so the
+    -- roster is non-empty here). Any OTHER nil reason = a dep was cold at join → the forge is deferred and the
+    -- forge-on-demand recovery at resleeveComplete re-attempts it (also guarded) once the deps are warm.
+    if reason and reason:sub(1, 11) == 'cap-reached' then
+        logFlow('warn', ('create src %d refused (%s) — routing to select'):format(src, reason))
+        local roster = {}
+        if pilaUp() then pcall(function() roster = exports['std-pila']:pilaListForAccount(accountRef) or {} end) end
+        startSelect(src, roster)
+        return
+    end
+    pendingCreate[src] = custodiaId   -- remember the body to persist the look onto (nil if the forge was deferred)
     pcall(function()
-        exports.atena:bucketAcquire(src)        -- isolated dimension for the per-player cinematic
-        exports['std-entry']:begin(src)         -- entry plays; bridge-entry releases the spawn at sceneEnded
+        exports['std-entry']:begin(src)         -- entry plays in the lobby; THIS conductor spawns at sceneEnded (entry cedes)
     end)
 end
 
@@ -147,7 +187,7 @@ end
 -- screen to the host CEF. The machine (std-charselect) only holds the server-side pilaIds it validates picks
 -- against; the NUI needs the NAMES to render — so we build cards (id+name) from the pila rows and send them
 -- straight to the client. slotsFree = cap − roster size (≥0) drives whether "new character" is offered.
-local function startSelect(src, roster)
+function startSelect(src, roster)
     if not charselectUp() then return end
     local options = {}   -- pilaId list the machine validates eligibility against (#6)
     local cards   = {}   -- { id, name } the host CEF renders — pila rows carry the name, the machine does not
@@ -158,7 +198,7 @@ local function startSelect(src, roster)
             cards[#cards + 1] = { id = id, name = (type(row) == 'table' and row.name) or 'Character' }
         end
     end
-    local slotsFree = math.max(0, (Bridge.maxPile or 1) - #options)
+    local slotsFree = math.max(0, Bridge.capFor(src) - #options)   -- per-account override (cap.lua) or global default
     pcall(function() exports['std-charselect']:open(src, options, slotsFree) end)
     -- Push cards + free-slot count to the host. The ui_page is mounted at resource start, so this lands with
     -- no mount race (nui.md §7 governs boot-time provider pushes, not a per-event push after mount).
@@ -170,6 +210,38 @@ end
 -- to spawn, or createNew handing the screen to the entry cinematic). Idempotent client-side.
 local function hideSelect(src) TriggerClientEvent('atena-bridge-charselect:closeSelect', src) end
 
+-- ── phase 3 (voice-verify) + phase 4 (enter world) — the lobby→world half of the lifecycle (§7.1.2) ─────
+-- Voice was OFF through the whole pre-spawn (lobby): ACTIVATE mumble on the client now, then give readiness
+-- a BOUNDED moment to land (skip-if-ok). The blocking config UI is a later slice; here we activate + wait
+-- briefly, then proceed — we never trap the spawn on an unverified mic yet. Yields → call from a thread.
+local VOICE_VERIFY_MS = 4000
+local function voiceVerify(src)
+    if not atenaUp() then return end
+    pcall(function() exports.atena:voiceActivate(src) end)
+    local deadline = GetGameTimer() + VOICE_VERIFY_MS
+    while GetGameTimer() < deadline do
+        if sessionStage(src) == nil then return end           -- player left while verifying
+        local ready
+        pcall(function() ready = exports.atena:voiceIsReady(src) end)
+        if ready then return end
+        Wait(250)
+    end
+    logFlow('warn', ('voice not verified for src %d within %dms — proceeding (blocking UI pending)'):format(src, VOICE_VERIFY_MS))
+end
+
+-- ENTER WORLD (phase 4): leave the shared lobby and spawn into the world. A GATED spawn STAYS in the lobby
+-- bucket for the hidden paint window — revealPlayer moves it to the world once the appearance is applied, so
+-- the bare base ped + model swap are never seen by SELF or OTHERS. A PLAIN spawn (no body bound → no reveal
+-- coming) is moved to the world HERE, before the spawn, or it would strand in the lobby bucket. Runs
+-- voice-verify (phase 3) first; yields → call from a thread.
+local function enterWorld(src, point, gate)
+    if not atenaUp() then return end
+    voiceVerify(src)
+    if sessionStage(src) == nil then return end               -- left during voice-verify
+    if not gate then pcall(function() exports.atena:bucketWorld(src) end) end   -- plain: no reveal will move us out of lobby
+    pcall(function() exports.atena:spawnPlayer(src, point, gate) end)
+end
+
 -- ── the conductor: the SINGLE owner of the pre-spawn decision ──────────────────────────────────────────
 -- preSpawn fires synchronously during atena's prepare(); place the hold NOW so the (delegated) spawn waits,
 -- resolve the account, query the roster, route. holdSpawn is ALWAYS placed first (even if a dep is down) so a
@@ -177,6 +249,10 @@ local function hideSelect(src) TriggerClientEvent('atena-bridge-charselect:close
 local function conduct(src)
     if not atenaUp() then return end
     pcall(function() exports.atena:holdSpawn(src, HOLD) end)   -- place the hold synchronously (recorded before prepare returns)
+    -- Phase 1 (§7.1.2): into the SHARED lobby for the WHOLE pre-spawn (every route — pick, select, create).
+    -- Voice stays off; other players' peds are hidden locally (atena bucket client) so the scene is isolated
+    -- without a per-player bucket. The player leaves the lobby only at phase 4 (enterWorld / revealPlayer).
+    pcall(function() exports.atena:bucketLobby(src) end)
 
     -- Resolve the route on a BOUNDED poll, not once at preSpawn: std-pila (the roster source) and the dep that
     -- takes the screen (charselect/entry) may be mid-(re)start, and routing that instant would strand the player
@@ -253,7 +329,7 @@ AddEventHandler('std-charselect:picked', function(src, pilaId)
         -- wrong spawn point until the saved look is on. pcall: a transient must not strand the held spawn.
         local gate = bound == true or nil
         logFlow('info', ('pick src %d -> %s spawn (custodia %s)'):format(src, gate and 'gated' or 'plain', tostring(custodiaId)))
-        pcall(function() exports.atena:spawnPlayer(src, Bridge.spawn, gate) end)
+        enterWorld(src, Bridge.spawn, gate)   -- phase 3 voice-verify + phase 4 lobby→world (gated stays in lobby until reveal)
     end)
 end)
 
@@ -306,7 +382,17 @@ end)
 -- Belt-and-braces cleanup of the pending create on the normal scene teardown / real spawn: by then the persist
 -- has already run at resleeveComplete (which clears it), so these are no-ops on the happy path — they guard the
 -- case where resleeveComplete never fired (scene skipped/aborted) so a stale body id can't linger for the src.
-AddEventHandler('std-entry:sceneEnded', function(src) pendingCreate[src] = nil end)
+-- CREATE-route phase 4: the cinematic ended → THIS conductor owns the spawn (entry cedes, §7.1.1). Run
+-- voice-verify, then the gated lobby→world spawn at the create exit. The create ALWAYS carries an authored
+-- appearance → ALWAYS gated (resleeveComplete already bound the body, so spawned→reapply paints + reveals).
+-- STAGE-GUARD: a debug replay fires sceneEnded on an already-in-world player → must NOT re-spawn them.
+AddEventHandler('std-entry:sceneEnded', function(src)
+    pendingCreate[src] = nil
+    if not atenaUp() then return end
+    local stage = sessionStage(src)
+    if stage ~= 'preparing' and stage ~= 'ready' then return end   -- only a genuinely pre-spawn player enters here
+    CreateThread(function() enterWorld(src, Bridge.spawn, true) end)
+end)
 AddEventHandler('atena:player:spawned', function(src) pendingCreate[src] = nil end)
 
 arm()
