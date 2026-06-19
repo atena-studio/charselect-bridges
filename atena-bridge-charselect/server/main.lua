@@ -14,6 +14,8 @@ local ROUTE_TIMEOUT_MS = 30000   -- bounded wait for std-pila + the target dep (
 local FORGE_TIMEOUT_MS = 10000   -- bounded wait for the account + pila/custodia bridges before a forge-on-demand
                                  -- (the player just finished authoring → deps are normally warm; this only covers
                                  -- the case where the join-time forge missed a still-cold dep)
+local BIND_TIMEOUT_MS = 5000     -- bounded wait for std-custodia on a PICK before falling back to a plain spawn —
+                                 -- a transient custodia restart must not drop a returning player onto the default ped
 
 -- Narrate the join/spawn flow into atena's log (the standalones stay headless — the bridge is the only layer
 -- that logs). Gated at call-time; a transient (atena mid-restart) just drops the line. tag groups it in docker.
@@ -42,15 +44,15 @@ local function arm()
     pcall(function() exports.atena:setSpawnDelegated(true) end)
 end
 
--- The account ref keying pile/custodia rows. getPlayer(src) returns the atena session { src, license, name,
--- stage, holds, account }; `account` is the DB row { id, license, ... }. The stable, canonical key is the
--- account's numeric id (license-keyed primary key). DB-down fallback: the license (still a stable identity),
--- so the conductor still routes (a fresh license → empty roster → entry). nil only if the session is gone.
-local function accountRefOf(src)
+-- The CANONICAL account key for ALL identity rows (pila.account / custodia.owner): the account's numeric id
+-- (the license-keyed primary key the pila/custodia rows are stored under). STRICT — no license fallback: a
+-- pila row is keyed by account.id, so routing/forging on the license (when the account hasn't loaded yet)
+-- would read an EMPTY roster for a returning player and forge a DUPLICATE character. nil = account not
+-- resolved yet (DB slow) or the session is gone; the conductor WAITS for it before routing, never guesses.
+local function accountIdOf(src)
     local p
     pcall(function() p = exports.atena:getPlayer(src) end)
-    if not p then return nil end
-    return (p.account and p.account.id) or p.license or nil
+    return (p and p.account and p.account.id) or nil
 end
 
 -- The player's atena session stage, or nil if the session is gone. A deferred route reads this to abort if the
@@ -64,28 +66,51 @@ end
 
 -- ── the three routes (create / select / pick) ─────────────────────────────────────────────────────────
 
+-- RELATION MODEL (the SSOT for the pila↔custodia↔account links, kept consistent here — the conductor owns
+-- the pair lifecycle). A character is THREE things bound into one whole: a pila (identity row, std-pila), a
+-- custodia (body row, std-custodia), and the pila SLEEVED into the body's locked `stack` slot. The link is
+-- CANONICAL in the inventory engine (the pila's item location = container:custodia/stack), MIRRORED onto
+-- custodia_bodies.pila_id because std-custodia is headless and can't read the engine (returning-pick resolves
+-- the body from that mirror via custodiaForPila). account-ref keys both rows (pila.account / custodia.owner =
+-- the account id). The engine's I.destroy cascades items but fires NO event, so the rows are dropped by the
+-- bridges — which means EVERY write path must keep the relation whole or roll it back. That invariant is
+-- enforced here (atomic forge) and in pilaRemove (clears the mirror on destroy).
+
+-- Best-effort teardown of one forged side, to roll back a partial forge so a failed create never strands an
+-- orphan row. Gated at call-time; a transient just leaves the row (a future reconcile/boot sweep can reap it).
+local function dropPila(id)     if id and pilaBridgeUp()     then pcall(function() exports['atena-bridge-pila']:pilaRemove(id) end) end end
+local function dropCustodia(id) if id and custodiaBridgeUp() then pcall(function() exports['atena-bridge-custodia']:custodiaRemove(id) end) end end
+
 -- Forge the durable pair behind a brand-new character: a pila (identity) + a custodia (body), with the pila
--- SLEEVED into the body's locked stack. Returns the custodiaId to bind the appearance to once entry resleeves,
--- or nil if a dep is down (caller still runs the cinematic — the look just won't persist this run). The pila
--- gets a default name (GetPlayerName) — an authored character name is a future slice (no naming UI yet).
+-- SLEEVED into the body's locked stack. ATOMIC: returns the custodiaId only for a WHOLE, sleeved pair; on any
+-- failure (a dep nil, or the sleeve rejected) it rolls back BOTH sides and returns nil + reason — never a
+-- half-forged orphan. The pila gets a default name (GetPlayerName) — authored names are a future slice.
 local function forgePair(src, accountRef)
     if accountRef == nil then return nil, 'no-account' end
     if not pilaBridgeUp() then return nil, 'pila-bridge-down' end
     if not custodiaBridgeUp() then return nil, 'custodia-bridge-down' end
-    local custodiaId, reason
+    local pilaId, custodiaId
     pcall(function()
         local name = GetPlayerName(src) or 'Character'   -- default name; naming UI is a future slice
-        local pilaId = exports['atena-bridge-pila']:pilaSpawn(accountRef, name)
-        custodiaId   = exports['atena-bridge-custodia']:custodiaSpawn(accountRef)   -- body owned by the account
-        if pilaId and custodiaId then
-            exports['atena-bridge-pila']:pilaSleeve(pilaId, custodiaId)             -- lock the pila in the stack
-        else
-            reason = (not pilaId) and 'pila-spawn-nil' or 'custodia-spawn-nil'
-            custodiaId = nil   -- a half-forged pair isn't a character — don't bind/persist onto it
-        end
+        pilaId     = exports['atena-bridge-pila']:pilaSpawn(accountRef, name)
+        custodiaId = exports['atena-bridge-custodia']:custodiaSpawn(accountRef)   -- body owned by the account
     end)
-    if not custodiaId and not reason then reason = 'forge-error' end   -- the pcall itself threw
-    return custodiaId, reason
+    -- A half-forged pair (one side nil, or the pcall threw mid-spawn) isn't a character — tear down whatever
+    -- did land so no orphan pila/custodia row survives.
+    if not (pilaId and custodiaId) then
+        dropPila(pilaId); dropCustodia(custodiaId)
+        return nil, (not pilaId) and 'pila-spawn-nil' or 'custodia-spawn-nil'
+    end
+    -- Sleeve locks the pila into the body's stack AND sets the body-row mirror. If it's rejected, the pair is
+    -- not whole (returning-pick would never resolve the body) → roll back both. pila-first: pilaRemove drops
+    -- the engine item + identity row + clears the (just-set-or-not) mirror, so custodiaRemove cascades clean.
+    local sleeved, err
+    pcall(function() sleeved, err = exports['atena-bridge-pila']:pilaSleeve(pilaId, custodiaId) end)
+    if not sleeved then
+        dropPila(pilaId); dropCustodia(custodiaId)
+        return nil, 'sleeve-failed:' .. tostring(err or 'nil')
+    end
+    return custodiaId, nil
 end
 
 -- Write the authored appearance onto the forged body and bind it to the session (so the spawn re-applies it
@@ -110,7 +135,7 @@ end
 -- create is always the 1st → never skippable yet. The real per-character skip is a future slice; default false.
 local function startCreate(src, skippable)   -- luacheck: ignore skippable
     if not atenaUp() or not entryUp() then return end
-    local accountRef = accountRefOf(src)
+    local accountRef = accountIdOf(src)
     pendingCreate[src] = forgePair(src, accountRef)   -- remember the body to persist the look onto (nil if a dep is down)
     pcall(function()
         exports.atena:bucketAcquire(src)        -- isolated dimension for the per-player cinematic
@@ -165,10 +190,24 @@ local function conduct(src)
         if stage == nil then return end                              -- player left while we waited
         if stage ~= 'preparing' and stage ~= 'ready' then return end -- already spawned (failsafe/other) → no route
 
-        local accountRef = accountRefOf(src)
+        -- The route (create vs select) hinges on the ROSTER, which is keyed by account.id. WAIT for the account
+        -- to resolve before deciding — routing on an unresolved account reads an empty roster for a returning
+        -- player and forges a DUPLICATE character. If it never resolves (DB stalled past the deadline) we do NOT
+        -- forge: cede to atena's pre-spawn failsafe (a plain spawn, no character). A degraded spawn is
+        -- recoverable on relog; a duplicate character is data corruption.
+        while accountIdOf(src) == nil and GetGameTimer() < deadline do
+            if sessionStage(src) == nil then return end
+            Wait(250)
+        end
+        local accountId = accountIdOf(src)
+        if accountId == nil then
+            logFlow('warn', ('route src %d: account unresolved past deadline — ceding to failsafe (no forge, avoids duplicate character)'):format(src))
+            return
+        end
+
         local roster = {}
-        if pilaUp() and accountRef ~= nil then
-            pcall(function() roster = exports['std-pila']:pilaListForAccount(accountRef) or {} end)
+        if pilaUp() then
+            pcall(function() roster = exports['std-pila']:pilaListForAccount(accountId) or {} end)
         end
 
         if #roster == 0 then
@@ -192,22 +231,30 @@ AddEventHandler('atena:player:preSpawn', conduct)
 AddEventHandler('std-charselect:picked', function(src, pilaId)
     hideSelect(src)   -- the choice is made → drop the screen + its focus before we spawn the player in
     if not atenaUp() then return end
-    local custodiaId, bound
-    if custodiaUp() then
-        pcall(function() custodiaId = exports['std-custodia']:custodiaForPila(pilaId) end)
-    end
-    if custodiaId then
-        pcall(function() bound = exports['atena-bridge-custodia']:bindBody(src, custodiaId) end)
-    end
-    -- Release the spawn. GATE ONLY WHEN A BODY IS BOUND: a gated spawn lands HIDDEN (black) and waits for the
-    -- bound body's paint → applied → revealPlayer. If nothing is bound (custodia down, no body resolved, or bind
-    -- failed) NOTHING would ever signal applied → the player would sit black until the 8s client backstop. So gate
-    -- only on a successful bind; otherwise spawn PLAIN (visible at once, default ped — better than a black wait).
-    -- A gated bind hides the base-ped model swap + the wrong spawn point until the saved look is on. pcall: a
-    -- transient must not strand the held spawn.
-    local gate = bound == true or nil
-    logFlow('info', ('pick src %d -> %s spawn (custodia %s)'):format(src, gate and 'gated' or 'plain', tostring(custodiaId)))
-    pcall(function() exports.atena:spawnPlayer(src, Bridge.spawn, gate) end)
+    -- Resolve + bind the body on a BOUNDED poll, then release the spawn. If custodia is transiently down
+    -- (mid-restart) WAIT for it rather than drop a RETURNING player onto the default ped — only fall back to a
+    -- plain spawn if it never comes. When custodia is already up the loop doesn't wait (no added latency).
+    CreateThread(function()
+        local deadline = GetGameTimer() + BIND_TIMEOUT_MS
+        while (not custodiaUp() or not custodiaBridgeUp()) and GetGameTimer() < deadline do
+            if sessionStage(src) == nil then return end   -- player left while we waited
+            Wait(250)
+        end
+        local custodiaId, bound
+        if custodiaUp() then
+            pcall(function() custodiaId = exports['std-custodia']:custodiaForPila(pilaId) end)
+        end
+        if custodiaId then
+            pcall(function() bound = exports['atena-bridge-custodia']:bindBody(src, custodiaId) end)
+        end
+        -- GATE ONLY WHEN A BODY IS BOUND: a gated spawn lands HIDDEN (black) until the bound body paints →
+        -- applied → revealPlayer. With nothing bound nothing signals applied → spawn PLAIN (visible at once,
+        -- default ped — better than a black wait to the 8s backstop). A gated bind hides the base-ped swap +
+        -- wrong spawn point until the saved look is on. pcall: a transient must not strand the held spawn.
+        local gate = bound == true or nil
+        logFlow('info', ('pick src %d -> %s spawn (custodia %s)'):format(src, gate and 'gated' or 'plain', tostring(custodiaId)))
+        pcall(function() exports.atena:spawnPlayer(src, Bridge.spawn, gate) end)
+    end)
 end)
 
 -- CREATE-NEW from the select screen (a free slot was chosen) → drop the screen, then the same create route
@@ -235,10 +282,10 @@ AddEventHandler('std-entry:resleeveComplete', function(src, _gender, blob)
         local deadline = GetGameTimer() + FORGE_TIMEOUT_MS
         while GetGameTimer() < deadline do
             if sessionStage(src) == nil then return end   -- player left mid-wait → stop (no orphan write, no lingering 10s)
-            if accountRefOf(src) ~= nil and pilaBridgeUp() and custodiaBridgeUp() then break end
+            if accountIdOf(src) ~= nil and pilaBridgeUp() and custodiaBridgeUp() then break end
             Wait(250)
         end
-        local id, reason = forgePair(src, accountRefOf(src))
+        local id, reason = forgePair(src, accountIdOf(src))
         if not id then
             logFlow('warn', ('create NOT persisted for src %d: %s (look lost on relog)'):format(src, reason or 'unknown'))
             return
